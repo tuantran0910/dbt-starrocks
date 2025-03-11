@@ -1,0 +1,104 @@
+name: Create CalVer Release
+
+on:
+  push:
+    tags:
+      - "release"
+      - "prerelease"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get current date
+        id: date
+        run: |
+          echo "DATE=$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+
+      - name: Get latest micro version
+        id: micro
+        run: |
+          MICRO=$(git tag | grep "^${{ steps.date.outputs.DATE }}\.[0-9]\+\(rc\)\?$" | sort -V | tail -n1 | awk -F. '{print $4}' | sed 's/rc$//')
+          if [ -z "$MICRO" ]; then
+            NEW_MICRO=0
+          else
+            NEW_MICRO=$(($MICRO + 1))
+          fi
+          echo "MICRO=$NEW_MICRO" >> $GITHUB_OUTPUT
+
+      - name: Get last release tag
+        id: last_release_tag
+        run: |
+          LAST_MICRO=$((${{ steps.micro.outputs.MICRO }} - 1))
+          if [ $LAST_MICRO -ge 0 ]; then
+            LAST_TAG="${{ steps.date.outputs.DATE }}.$LAST_MICRO"
+            if git tag | grep -q "^$LAST_TAG$"; then
+              echo "LAST_TAG=$LAST_TAG" >> $GITHUB_OUTPUT
+            else
+              echo "LAST_TAG=initial" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "LAST_TAG=initial" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine release type and create new tag
+        id: tag
+        run: |
+          TRIGGER_TAG="${{ github.ref_name }}"
+          BASE_TAG="${{ steps.date.outputs.DATE }}.${{ steps.micro.outputs.MICRO }}"
+          if [ "$TRIGGER_TAG" = "prerelease" ]; then
+            NEW_TAG="${BASE_TAG}rc"
+            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+            echo "RELEASE_NAME=Prerelease $NEW_TAG" >> $GITHUB_OUTPUT
+          else
+            NEW_TAG="$BASE_TAG"
+            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+            echo "RELEASE_NAME=Release $NEW_TAG" >> $GITHUB_OUTPUT
+          fi
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "Creating tag $NEW_TAG"
+          git tag $NEW_TAG
+          git push origin $NEW_TAG
+
+      - name: Delete trigger tag
+        run: |
+          TRIGGER_TAG="${{ github.ref_name }}"
+          echo "Deleting trigger tag $TRIGGER_TAG"
+          git push origin --delete $TRIGGER_TAG
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          if [ "${{ steps.last_release_tag.outputs.LAST_TAG }}" != "initial" ]; then
+            echo "## What Changes ?" >> release_notes.md
+            echo "" >> release_notes.md
+            git log --pretty=format:'- [%h](https://github.com/user/repo/commit/%H) %s' ${{ steps.last_release_tag.outputs.LAST_TAG }}..HEAD | sed 's/^/  /' >> release_notes.md
+          else
+            echo "Initial release" > release_notes.md
+          fi
+          cat << EOF >> $GITHUB_OUTPUT
+          RELEASE_NOTES<<DELIMITER
+          $(cat release_notes.md)
+          DELIMITER
+          EOF
+          echo "Generated release notes:"
+          cat release_notes.md
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.NEW_TAG }}
+          release_name: ${{ steps.tag.outputs.RELEASE_NAME }}
+          body: ${{ steps.release_notes.outputs.RELEASE_NOTES }}
+          draft: false
+          prerelease: ${{ steps.tag.outputs.IS_PRERELEASE }}
