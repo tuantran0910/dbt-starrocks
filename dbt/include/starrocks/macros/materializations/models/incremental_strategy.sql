@@ -1,5 +1,5 @@
 {% macro starrocks__validate_microbatch_config(config) %}
-    {% set required_config_keys = ['keys', 'event_time', 'begin', 'batch_size'] %}
+    {% set required_config_keys = ['event_time', 'begin', 'batch_size'] %}
     {% for key in required_config_keys %}
         {% if not config.get(key) %}
             {% do exceptions.raise_compiler_error("The 'microbatch' incremental strategy requires the '" ~ key ~ "' configuration to be set.") %}

@@ -47,7 +47,8 @@
 {% endmacro %}
 
 {% macro get_insert_overwrite_into_sql(target_relation, temp_relation, dest_columns) %}
-    {%- do return(_get_strategy_sql(target_relation, temp_relation, dest_columns, true, false)) -%}
+    {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute="name")) -%}
+    {%- do return(_get_strategy_sql(target_relation, temp_relation, dest_cols_csv, true, false)) -%}
 {% endmacro %}
 
 {% macro get_dynamic_overwrite_into_sql(target_relation, temp_relation, dest_columns) %}
@@ -57,110 +58,95 @@
         {%- endset -%}
         {{ exceptions.raise_compiler_error(msg) }}
     {% else %}
-        {%- do return(_get_strategy_sql(target_relation, temp_relation, dest_columns, true, true)) -%}
+        {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute="name")) -%}
+        {%- do return(_get_strategy_sql(target_relation, temp_relation, dest_cols_csv, true, true)) -%}
+    {% endif %}
+{% endmacro %}
+
+{% macro starrocks__get_incremental_microbatch_sql(arg_dict) %}
+    {% set microbatch_use_dynamic_overwrite = config.get('microbatch_use_dynamic_overwrite') or False %}
+    {% if microbatch_use_dynamic_overwrite %}
+        {% do return(get_incremental_dynamic_overwrite_sql(arg_dict)) %}
+    {% else %}
+        {% do return(get_incremental_insert_overwrite_sql(arg_dict)) %}
     {% endif %}
 {% endmacro %}
 
 {% materialization incremental, adapter='starrocks' %}
     {% set keys = config.get('keys', validator=validation.any[list]) %}
-    {% set strategy = starrocks__validate_get_incremental_strategy(config) %}
-    {% set microbatch_use_dynamic_overwrite = config.get('microbatch_use_dynamic_overwrite') or False %}
-    {% if microbatch_use_dynamic_overwrite and strategy != 'microbatch' %}
-        {% do log("The 'microbatch_use_dynamic_overwrite' configuration can only be set when using the 'microbatch' incremental strategy.", warn=True) %}
-        {% set microbatch_use_dynamic_overwrite = False %}
-    {% endif %}
-
     {% set full_refresh_mode = (should_full_refresh()) %}
-    {% set existing_relation = load_relation(this) %}
-    {% set is_target_relation_existed, target_relation = get_or_create_relation(
-        database=this.database,
-        schema=this.schema,
-        identifier=this.identifier,
+    {% set identifier = this.name %}
+    {% set target_relation = api.Relation.create(
+        identifier=identifier,
+        schema=schema,
+        database=database,
         type='table',
     ) %}
-    {% set tmp_relation = make_temp_relation(this) %}
+    {% set existing_relation = load_relation(this) %}
+    {% set incremental_strategy = starrocks__validate_get_incremental_strategy(config) %}
+    {% set tmp_relation_type = 'table' %}
+    {% set tmp_relation = make_temp_relation(this).incorporate(type=tmp_relation_type) %}
+    {% set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') %}
 
-    {{ run_hooks(pre_hooks, inside_transaction=False) }}
-    {{ run_hooks(pre_hooks, inside_transaction=True) }}
-    {% set to_drop = [] %}
+    {{ run_hooks(pre_hooks) }}
 
-    {% if not keys or strategy == 'default' %}
-        {% if existing_relation is none %}
-            {% set build_sql = starrocks__create_table_as(False, target_relation, sql) %}
-        {% elif existing_relation.is_view or full_refresh_mode %}
-            {% if existing_relation.is_view %}
-                {% do starrocks__drop_relation(existing_relation) %}
-                {% set build_sql = starrocks__create_table_as(False, target_relation, sql) %}
-            {% else %}
-                {% set backup_identifier = existing_relation.identifier ~ "__dbt_backup" %}
-                {% set backup_relation = existing_relation.incorporate(path={"identifier": backup_identifier}) %}
-                {% do adapter.drop_relation(backup_relation) %}
-                {% set run_sql = starrocks__create_table_as(False, backup_relation, sql) %}
-                {% call statement("run_sql") %}
-                    {{ run_sql }}
-                {% endcall %}
-                {% do starrocks__exchange_relation(target_relation, backup_relation) %}
-                {% set build_sql = "select 'hello starrocks'" %}
-            {% endif %}
-        {% else %}
-            {% do to_drop.append(tmp_relation) %}
-            {% do run_query(create_table_as(True, tmp_relation, sql)) %}
-            {% set dest_columns = adapter.get_columns_in_relation(target_relation) | map(attribute='quoted') | join(', ') %}
-            {% set build_sql = _get_strategy_sql(target_relation, tmp_relation, dest_columns, false) %}
+    {% if existing_relation is none %}
+        {%- call statement('main') -%}
+            {{ starrocks__create_table_as(False, target_relation, compiled_code) }}
+        {%- endcall -%}
+
+    {% elif existing_relation.is_view %}
+        {#-- Can't overwrite a view with a table - we must drop --#}
+        {{ log("Dropping relation " ~ target_relation ~ " because it is a view and this model is a table.", info=True) }}
+        {% do adapter.drop_relation(existing_relation) %}
+        {%- call statement('main') -%}
+            {{ starrocks__create_table_as(False, target_relation, compiled_code) }}
+        {%- endcall -%}
+
+    {% elif full_refresh_mode %}
+        {#-- First create a backup of the existing table and then exchange the new table with the backup --#}
+        {% set backup_identifier = existing_relation.identifier ~ "__dbt_backup" %}
+        {% set backup_relation = existing_relation.incorporate(path={"identifier": backup_identifier}) %}
+        {% do adapter.drop_relation(backup_relation) %}
+        {% call statement('main') -%}
+            {{ starrocks__create_table_as(False, backup_relation, compiled_code) }}
+        {%- endcall -%}
+        {% do starrocks__exchange_relation(target_relation, backup_relation) %}
+    {% else %}
+        {#-- Create the temp relation, either as a view or as a temp table --#}
+        {%- call statement('create_tmp_relation') -%}
+            {{ starrocks__create_table_as(True, tmp_relation, compiled_code) }}
+        {%- endcall -%}
+
+        {% do adapter.expand_target_column_types(
+            from_relation=tmp_relation,
+            to_relation=target_relation) %}
+        {#-- Process schema changes. Returns dict of changes if successful. Use source columns for upserting/merging --#}
+        {% set dest_columns = process_schema_changes(on_schema_change, tmp_relation, existing_relation) %}
+        {% if not dest_columns %}
+            {% set dest_columns = adapter.get_columns_in_relation(existing_relation) %}
         {% endif %}
-    {% elif strategy in ['insert_overwrite', 'dynamic_overwrite', 'microbatch'] %}
-        {% if not is_target_relation_existed %}
-            {% set build_sql = starrocks__create_table_as(False, target_relation, sql) %}
-        {% elif existing_relation.is_view or full_refresh_mode %}
-            {% if existing_relation.is_view %}
-                {% do starrocks__drop_relation(existing_relation) %}
-                {% set build_sql = starrocks__create_table_as(False, target_relation, sql) %}
-            {% else %}
-                {% set backup_identifier = existing_relation.identifier ~ "__dbt_backup" %}
-                {% set backup_relation = existing_relation.incorporate(path={"identifier": backup_identifier}) %}
-                {% do starrocks__drop_relation(backup_relation) %}
-                {% set run_sql = starrocks__create_table_as(False, backup_relation, sql) %}
-                {% call statement("run_sql") %}
-                    {{ run_sql }}
-                {% endcall %}
-                {% do starrocks__exchange_relation(target_relation, backup_relation) %}
-                {% set build_sql = "select 'hello starrocks'" %}
-            {% endif %}
-        {% else %}
-            {% do run_query(starrocks__create_table_as(True, tmp_relation, sql)) %}
-            {% do to_drop.append(tmp_relation) %}
-            {% do adapter.expand_target_column_types(
-                  from_relation=tmp_relation,
-                  to_relation=target_relation
-            ) %}
-            {% set dest_columns = adapter.get_columns_in_relation(target_relation) | map(attribute='quoted') | join(', ') %}
-            {% if strategy == 'insert_overwrite' or (strategy == 'microbatch' and not microbatch_use_dynamic_overwrite) %}
-                {% set build_sql = get_incremental_insert_overwrite_sql(({
-                    "target_relation": target_relation,
-                    "temp_relation": tmp_relation,
-                    "dest_columns": dest_columns
-                })) %}
-            {% elif strategy == 'dynamic_overwrite' or (strategy == 'microbatch' and microbatch_use_dynamic_overwrite) %}
-                {% set build_sql = get_incremental_dynamic_overwrite_sql(({
-                    "target_relation": target_relation,
-                    "temp_relation": tmp_relation,
-                    "dest_columns": dest_columns
-                })) %}
-            {% endif %}
-        {% endif %}
+
+        {#-- Get the incremental_strategy, the macro to use for the strategy, and build the sql --#}
+        {% set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) %}
+        {% set strategy_sql_macro_func = adapter.get_incremental_strategy_macro(context, incremental_strategy) %}
+        {% do log(strategy_sql_macro_func, info=True) %}
+        {% set strategy_arg_dict = ({'target_relation': target_relation, 'temp_relation': tmp_relation, 'unique_key': keys, 'dest_columns': dest_columns, 'incremental_predicates': incremental_predicates }) %}
+
+        {%- call statement('main') -%}
+            {{ strategy_sql_macro_func(strategy_arg_dict) }}
+        {%- endcall -%}
     {% endif %}
 
-    {% call statement("main") %}
-        {{ build_sql }}
-    {% endcall %}
+    {% do drop_relation_if_exists(tmp_relation) %}
 
+    {{ run_hooks(post_hooks) }}
+
+    {% set target_relation = target_relation.incorporate(type='table') %}
+
+    {% set should_revoke = should_revoke(existing_relation.is_table, full_refresh_mode) %}
+    {% do apply_grants(target_relation, grant_config, should_revoke=should_revoke) %}
     {% do persist_docs(target_relation, model) %}
 
-    {{ run_hooks(post_hooks, inside_transaction=True) }}
-    {% do adapter.commit() %}
-    {% for rel in to_drop %}
-        {% do starrocks__drop_relation(rel) %}
-    {% endfor %}
-    {{ run_hooks(post_hooks, inside_transaction=False) }}
     {{ return({'relations': [target_relation]}) }}
-{% endmaterialization %}
+{%- endmaterialization %}
