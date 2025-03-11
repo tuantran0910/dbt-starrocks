@@ -1,0 +1,55 @@
+[project]
+name = "dbt-starrocks"
+dynamic = ["version"]
+description = "The set of adapter protocols and base functionality that supports integration Starrocks with dbt-core"
+readme = "README.md"
+keywords = ["dbt", "adapter", "adapters", "database", "elt", "dbt-core", "starrocks"]
+requires-python = ">=3.10,<3.13"
+authors = [
+    { name = "tuantran0910", email = "tntuan0910@gmail.com" },
+]
+maintainers = [
+    { name = "tuantran0910", email = "tntuan0910@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "dbt-core>=1.9.0",
+    "mysql-connector-python>=9.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "dbt-tests-adapter>=1.11.0",
+    "pytest>=8.3.5",
+    "pytest-dotenv>=0.5.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/tuantran0910/dbt-starrocks"
+Repository = "https://github.com/tuantran0910/dbt-starrocks.git"
+Issues = "https://github.com/tuantran0910/dbt-starrocks/issues"
+
+[build-system]
+requires = ["hatchling", "uv-dynamic-versioning"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["dbt"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["dbt"]
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.uv-dynamic-versioning]
+pattern = "default-unprefixed"

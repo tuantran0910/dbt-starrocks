@@ -42,6 +42,7 @@ class StarRocksConfig(AdapterConfig):
     distributed_by: Optional[List[str]] = None
     buckets: Optional[int] = None
     properties: Optional[Dict[str, str]] = None
+    microbatch_use_dynamic_overwrite: Optional[bool] = None
 
 
 class StarRocksAdapter(SQLAdapter):
@@ -66,9 +67,7 @@ class StarRocksAdapter(SQLAdapter):
         return "`{}`".format(identifier)
 
     def check_schema_exists(self, database, schema):
-        results = self.execute_macro(
-            LIST_SCHEMAS_MACRO_NAME, kwargs={"database": database}
-        )
+        results = self.execute_macro(LIST_SCHEMAS_MACRO_NAME, kwargs={"database": database})
 
         exists = True if schema in [row[0] for row in results] else False
         return exists
@@ -107,8 +106,7 @@ class StarRocksAdapter(SQLAdapter):
         schema_map = self._get_catalog_schemas(manifest)
         if len(schema_map) > 1:
             dbt.exceptions.CompilationError(
-                f"Expected only one database in get_catalog, found "
-                f"{list(schema_map)}"
+                f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
             )
 
         with executor(self.config) as tpe:
@@ -150,7 +148,8 @@ class StarRocksAdapter(SQLAdapter):
             server_version = conn.handle.server_version
             server_version_tuple = tuple(server_version)
             version_detail_tuple = tuple(
-                int(part) for part in version.split(".") if part.isdigit())
+                int(part) for part in version.split(".") if part.isdigit()
+            )
             if version_detail_tuple > server_version_tuple:
                 return True
         return False
@@ -162,7 +161,7 @@ class StarRocksAdapter(SQLAdapter):
             server_version = conn.handle.server_version
             if server_version != (999, 999, 999):
                 return "{}.{}.{}".format(server_version[0], server_version[1], server_version[2])
-        return 'UNKNOWN'
+        return "UNKNOWN"
 
     def _get_one_catalog(
         self,
@@ -172,18 +171,19 @@ class StarRocksAdapter(SQLAdapter):
     ) -> agate.Table:
         if len(schemas) != 1:
             dbt.exceptions.CompilationError(
-                f"Expected only one schema in StarRocks _get_one_catalog, found "
-                f"{schemas}"
+                f"Expected only one schema in StarRocks _get_one_catalog, found " f"{schemas}"
             )
 
         return super()._get_one_catalog(information_schema, schemas, used_schemas)
 
     @override
     def valid_incremental_strategies(self):
-        return ["default", "insert_overwrite", "dynamic_overwrite"]
+        return ["default", "insert_overwrite", "dynamic_overwrite", "microbatch"]
 
 
-def _catalog_filter_schemas(used_schemas: FrozenSet[Tuple[str, str]]) -> Callable[[agate.Row], bool]:
+def _catalog_filter_schemas(
+    used_schemas: FrozenSet[Tuple[str, str]]
+) -> Callable[[agate.Row], bool]:
     schemas = frozenset((None, s.lower()) for d, s in used_schemas)
 
     def test(row: agate.Row) -> bool:
